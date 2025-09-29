@@ -9,7 +9,8 @@ import time
 from typing import Optional, List, Dict
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai as genai_new
+from google.genai import types as genai_types
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +22,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 import ffmpeg
+import boto3
+from botocore.config import Config as BotoConfig
 
 # Load environment variables from .env file
 load_dotenv()
@@ -51,14 +54,37 @@ app.mount("/web", StaticFiles(directory="web"), name="web")
 # In-memory storage for request tracking
 active_requests: Dict[str, float] = {}
 
-# Configure Gemini
+# Configure Gemini (new SDK)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-pro")
 
 if not GOOGLE_API_KEY:
     raise RuntimeError("GOOGLE_API_KEY environment variable is required")
 
-genai.configure(api_key=GOOGLE_API_KEY)
+GENAI_CLIENT = genai_new.Client(api_key=GOOGLE_API_KEY)
+
+# R2 configuration
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_BUCKET = os.getenv("R2_BUCKET")
+R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL")  # optional, e.g. https://cdn.example.com
+
+def create_r2_client():
+    if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET]):
+        return None
+    endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    session = boto3.session.Session()
+    return session.client(
+        's3',
+        region_name='auto',
+        endpoint_url=endpoint,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=BotoConfig(s3={'addressing_style': 'virtual'})
+    )
+
+R2_CLIENT = create_r2_client()
 
 # Pydantic models
 class FeedbackItem(BaseModel):
@@ -74,9 +100,12 @@ MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB
 MAX_DURATION_SECONDS = 60  # 1 minute (trim to this)
 TIMEOUT_SECONDS = 180  # 3 minutes
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
+# Gemini media resolution (set in code, not user-provided)
+MEDIA_RESOLUTION = "MEDIA_RESOLUTION_LOW"
 
 def load_prompt_from_file() -> str:
     """Load the base prompt from prompt.md file."""
+    r2_task = None
     try:
         prompt_path = Path("prompt.md")
         if not prompt_path.exists():
@@ -231,6 +260,30 @@ async def stream_upload_to_file(upload: UploadFile, temp_path: str) -> int:
     
     return total_size
 
+async def upload_to_r2_background(file_path: str, request_id: str, logger_adapter: logging.LoggerAdapter) -> None:
+    """Upload a local file to R2 in the background without blocking the main flow."""
+    if not R2_CLIENT:
+        logger_adapter.info("R2 client not configured; skipping R2 upload")
+        return
+    try:
+        # Build object key
+        timestamp_part = str(int(time.time()))
+        object_key = f"raw/{request_id}/{timestamp_part}.mp4"
+
+        logger_adapter.info(f"Starting non-blocking R2 upload: s3://{R2_BUCKET}/{object_key}")
+        # Perform upload
+        with open(file_path, 'rb') as f:
+            R2_CLIENT.upload_fileobj(f, R2_BUCKET, object_key)
+
+        public_url = None
+        if R2_PUBLIC_BASE_URL:
+            public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{object_key}"
+        logger_adapter.info(
+            f"R2 upload complete: key={object_key}" + (f", url={public_url}" if public_url else "")
+        )
+    except Exception as e:
+        logger_adapter.warning(f"R2 upload failed: {str(e)}")
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     """Serve the main frontend page."""
@@ -284,6 +337,9 @@ async def analyze_video(
         req_logger.info("Starting file upload stream")
         file_size = await stream_upload_to_file(file, temp_file_path)
         req_logger.info(f"Upload complete - Size: {file_size} bytes")
+
+        # Kick off non-blocking upload to R2 from the temp file; do not await
+        r2_task = asyncio.create_task(upload_to_r2_background(temp_file_path, request_id, req_logger))
         
         # Trim video to MAX_DURATION_SECONDS
         trimmed_fd, trimmed_file_path = tempfile.mkstemp(suffix="_trimmed.mp4")
@@ -293,62 +349,44 @@ async def analyze_video(
         if not trim_video_to_duration(temp_file_path, trimmed_file_path):
             raise HTTPException(status_code=500, detail="Video processing failed")
         
-        # Upload to Gemini with timeout
-        req_logger.info("Uploading to Gemini API")
-        try:
-            uploaded_file = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None, genai.upload_file, trimmed_file_path
-                ),
-                timeout=TIMEOUT_SECONDS // 3  # Use 1/3 of total timeout for upload
-            )
-        except asyncio.TimeoutError:
-            req_logger.error("Gemini upload timed out")
-            raise HTTPException(status_code=504, detail="Video upload timeout")
-        
-        # Wait for processing with timeout
-        req_logger.info("Waiting for Gemini processing")
-        processing_start = time.time()
-        try:
-            while uploaded_file.state.name == "PROCESSING":
-                if time.time() - processing_start > TIMEOUT_SECONDS // 2:
-                    req_logger.error("Gemini processing timed out")
-                    raise HTTPException(status_code=504, detail="Video processing timeout")
-                    
-                await asyncio.sleep(2)
-                uploaded_file = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
-                        None, genai.get_file, uploaded_file.name
-                    ),
-                    timeout=10
-                )
-        except asyncio.TimeoutError:
-            req_logger.error("Gemini processing status check timed out")
-            raise HTTPException(status_code=504, detail="Processing timeout")
-        
-        if uploaded_file.state.name == "FAILED":
-            req_logger.error("Gemini video processing failed")
-            raise HTTPException(status_code=500, detail="Video processing failed")
-        
         # Create analysis prompt
         prompt = create_analysis_prompt(stroke, camera_side)
         
-        # Initialize model and generate analysis
-        model = genai.GenerativeModel(MODEL_NAME)
-        
+        # Build contents: include video bytes and prompt
+        try:
+            with open(trimmed_file_path, 'rb') as vf:
+                video_bytes = vf.read()
+        except Exception as e:
+            req_logger.error(f"Failed reading trimmed video: {str(e)}")
+            raise HTTPException(status_code=500, detail="Video read failed")
+
+        contents = [
+            genai_types.Content(
+                role="user",
+                parts=[
+                    genai_types.Part.from_bytes(data=video_bytes, mime_type="video/mp4"),
+                    genai_types.Part.from_text(text=prompt),
+                ],
+            )
+        ]
+
         req_logger.info("Generating AI analysis")
         try:
+            # Build generation config with code-level media resolution
+            gen_config_kwargs = {
+                'temperature': 0.3,
+                'media_resolution': MEDIA_RESOLUTION,
+            }
+
             response = await asyncio.wait_for(
                 asyncio.get_event_loop().run_in_executor(
                     None,
                     partial(
-                        model.generate_content,
-                        [uploaded_file, prompt],
-                        generation_config=genai.types.GenerationConfig(
-                            temperature=0.3,
-                            max_output_tokens=4000,
-                        ),
-                    ),
+                        GENAI_CLIENT.models.generate_content,
+                        model=MODEL_NAME,
+                        contents=contents,
+                        config=genai_types.GenerateContentConfig(**gen_config_kwargs),
+                    )
                 ),
                 timeout=TIMEOUT_SECONDS // 3  # Use 1/3 of total timeout for generation
             )
@@ -357,7 +395,8 @@ async def analyze_video(
             raise HTTPException(status_code=504, detail="Analysis timeout")
         
         # Parse response
-        response_text = response.text.strip()
+        # New SDK returns an object with .text for aggregated text
+        response_text = (getattr(response, 'text', '') or '').strip()
         req_logger.info("Analysis complete, parsing results")
         
         # Try to extract JSON from response
@@ -392,7 +431,16 @@ async def analyze_video(
         )
     finally:
         # Clean up temporary files
-        cleanup_files = [temp_file_path, trimmed_file_path]
+        # If R2 upload is still running, avoid deleting the source temp file.
+        if r2_task and not r2_task.done():
+            try:
+                await asyncio.wait_for(r2_task, timeout=5)
+            except asyncio.TimeoutError:
+                req_logger.info("R2 upload still in progress; leaving temp file for uploader to read")
+        cleanup_files = [trimmed_file_path]
+        # Only delete the source temp file if no R2 task is running or it's done
+        if not r2_task or r2_task.done():
+            cleanup_files.insert(0, temp_file_path)
         for file_path in cleanup_files:
             if file_path and os.path.exists(file_path):
                 try:
@@ -401,15 +449,7 @@ async def analyze_video(
                 except Exception as cleanup_error:
                     req_logger.warning(f"Cleanup error: {cleanup_error}")
         
-        # Clean up uploaded file
-        if uploaded_file:
-            try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, genai.delete_file, uploaded_file.name
-                )
-                req_logger.info("Cleaned up Gemini uploaded file")
-            except Exception as cleanup_error:
-                req_logger.warning(f"Gemini cleanup error: {cleanup_error}")
+        # No remote file cleanup needed with direct-bytes approach
 
 @app.get("/health")
 async def health_check():

@@ -660,6 +660,7 @@
                 const progressSection = document.getElementById('progressSection');
                 const resultsSection = document.getElementById('resultsSection');
                 const newAnalysisSection = document.getElementById('newAnalysisSection');
+                const uploadZone = document.getElementById('uploadZone');
                 const videoPlayer = document.getElementById('videoPlayer');
                 const resultsTableBody = document.getElementById('resultsTableBody');
 
@@ -669,6 +670,7 @@
                 progressSection.style.display = 'none';
                 resultsSection.style.display = 'block';
                 newAnalysisSection.style.display = 'block';
+                uploadZone.style.display = 'none';
 
                 // Set video source
                 const videoURL = URL.createObjectURL(this.currentFile);
@@ -786,6 +788,7 @@
                 
                 // Reset UI
                 document.getElementById('uploadZone').classList.remove('has-file');
+                document.getElementById('uploadZone').style.display = 'block';
                 document.getElementById('fileDetails').style.display = 'none';
                 document.getElementById('progressSection').style.display = 'none';
                 document.getElementById('resultsSection').style.display = 'none';

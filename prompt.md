@@ -11,10 +11,10 @@ Return a JSON object with this exact structure:
   ]
 }
 
-Focus on common swimming technique issues:
+For every sampled frame, you must analyze the swimmer's technique against all eight factors listed below:
 
 ## 1. Body position
-- Head neutral, eyes down/forward  
+- Head neutral, eyes down/forward
 - Hips high, body flat in waterline  
 - Controlled roll, no fishtail sway  
 
@@ -63,8 +63,7 @@ Focus on common swimming technique issues:
 Guidelines:
 - Use timestamp format "M:SS.s" (e.g., "1:23.5" for 1 minute 23.5 seconds)
 - Be specific and actionable in suggestions
-- Only report significant technique issues
-- Limit to most important feedback points
+- Report all major and minor technique issues - add a comment in brackets (Major) or (Minor) for each issue
 - Return empty feedback array if no issues detected
 
 Example response:
@@ -72,13 +71,14 @@ Example response:
   "feedback": [
     {
       "timestamp": "0:15.2",
-      "issue": "Head position too high during freestyle",
+      "issue": " (Major) Head position too high during freestyle",
       "suggestion": "Keep head in neutral position, eyes looking down at pool bottom"
     },
     {
       "timestamp": "0:42.8",
-      "issue": "Crossing over center line during arm entry",
+      "issue": "(Minor) Some crossing over center line during left arm entry",
       "suggestion": "Enter hand in line with shoulder to maintain straight pull path"
-    }
+    },
+    
   ]
 }
