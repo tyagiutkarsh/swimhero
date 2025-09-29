@@ -18,6 +18,12 @@ cp .env.example .env               # Copy environment template
 ./start.sh                         # Run automated setup script
 ```
 
+### Docker
+```bash
+docker build -t swimhero .
+docker run -p 8000:8000 -e GOOGLE_API_KEY={gemini_api_key} swimhero
+```
+
 ### Development Server
 ```bash
 source venv/bin/activate           # Always activate virtual environment first

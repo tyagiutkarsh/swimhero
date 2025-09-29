@@ -75,54 +75,27 @@ MAX_DURATION_SECONDS = 60  # 1 minute (trim to this)
 TIMEOUT_SECONDS = 180  # 3 minutes
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
 
+def load_prompt_from_file() -> str:
+    """Load the base prompt from prompt.md file."""
+    try:
+        prompt_path = Path("prompt.md")
+        if not prompt_path.exists():
+            raise FileNotFoundError("prompt.md file not found")
+        
+        content = prompt_path.read_text()
+        
+        return content
+        
+    except Exception as e:
+        logger.error(f"Error loading prompt from file: {str(e)}")
+        # Fallback to a minimal prompt if file loading fails
+        return """Analyze this swimming video for technique issues and provide feedback in JSON format with timestamps, issues, and suggestions."""
+
 def create_analysis_prompt(stroke: Optional[str] = None, camera_side: Optional[str] = None) -> str:
     """Create the analysis prompt for Gemini."""
     
-    base_prompt = """
-Analyze this swimming video for technique issues. Sample the video at 1 frame per second and provide feedback in strict JSON format only.
-
-Return a JSON object with this exact structure:
-{
-  "feedback": [
-    {
-      "timestamp": "M:SS.s",
-      "issue": "Brief description of the technique issue",
-      "suggestion": "Specific improvement suggestion"
-    }
-  ]
-}
-
-Focus on common swimming technique issues:
-- Body position and alignment
-- Stroke mechanics (catch, pull, recovery)
-- Breathing technique
-- Kick effectiveness
-- Timing and rhythm
-- Entry and exit technique
-
-Guidelines:
-- Use timestamp format "M:SS.s" (e.g., "1:23.5" for 1 minute 23.5 seconds)
-- Be specific and actionable in suggestions
-- Only report significant technique issues
-- Limit to most important feedback points
-- Return empty feedback array if no issues detected
-
-Example response:
-{
-  "feedback": [
-    {
-      "timestamp": "0:15.2",
-      "issue": "Head position too high during freestyle",
-      "suggestion": "Keep head in neutral position, eyes looking down at pool bottom"
-    },
-    {
-      "timestamp": "0:42.8",
-      "issue": "Crossing over center line during arm entry",
-      "suggestion": "Enter hand in line with shoulder to maintain straight pull path"
-    }
-  ]
-}
-"""
+    # Load base prompt from file
+    base_prompt = load_prompt_from_file()
     
     # Add stroke-specific context
     if stroke:
